@@ -17,7 +17,7 @@ def cli(work_path=None, debug=False, log_file=None):
     logging.basicConfig(format='%(asctime)s [%(levelname)s] [%(name)s] %(message)s',
                         filename=log_file, filemode='w',
                         level=logging.INFO if not debug else logging.DEBUG)
-    
+
     logger.info("Working path: %s", work_path)
     seslib.GlobalSettings.WORKING_DIR = work_path
 
@@ -33,7 +33,8 @@ def list():
 @click.argument('owner')
 @click.argument('name')
 def create(owner, name):
-    seslib.create_deployment(owner, name)
+    dep = seslib.create_deployment(owner, name, seslib.Settings())
+    click.echo(dep.generate_vagrantfile())
 
 
 if __name__ == '__main__':
