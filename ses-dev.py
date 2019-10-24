@@ -33,8 +33,7 @@ def list():
 @click.argument('owner')
 @click.argument('name')
 def create(owner, name):
-    dep = seslib.create_deployment(owner, name, seslib.Settings())
-    click.echo(dep.generate_vagrantfile())
+    seslib.create_deployment(owner, name, seslib.Settings())
 
 
 if __name__ == '__main__':

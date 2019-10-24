@@ -1,10 +1,13 @@
 import json
 from json import JSONEncoder
-import os
-import uuid
 import logging
+import os
+
+from Crypto.PublicKey import RSA
 
 from jinja2 import Environment, PackageLoader, select_autoescape
+
+from . import tools
 
 
 METADATA_FILENAME = ".metadata"
@@ -23,7 +26,25 @@ class GlobalSettings(object):
         cls.WORKING_DIR = working_dir
 
 
+OS_BOX_MAPPING = {
+    'leap-15.1': 'https://download.opensuse.org/repositories/Virtualization:/Appliances:/Images:/openSUSE-Leap-15.1/images/Leap-15.1.x86_64-libvirt.box',
+    'tumbleweed': 'https://download.opensuse.org/repositories/Virtualization:/Appliances:/Images:/openSUSE-Tumbleweed/openSUSE_Tumbleweed/Tumbleweed.x86_64-libvirt.box',
+    'sles-15-sp1': 'http://download.suse.de/ibs/Virtualization:/Vagrant:/SLE-15-SP1/images/boxes/SLES15-SP1-Vagrant.x86_64.json',
+    'sles-12-sp3': 'http://download.suse.de/ibs/Devel:/Storage:/5.0/vagrant/sle12sp3.x86_64.box',
+}
+
+
 SETTINGS = {
+    'version': {
+        'type': str,
+        'help': 'SES version to install (ses5, ses6, luminous, nautilus, octopus)',
+        'default': 'nautilus'
+    },
+    'os': {
+        'type': str,
+        'help': 'openSUSE OS version (leap-15.1, tumbleweed, sles-12-sp3, or sles-15-sp1)',
+        'default': 'leap-15.1'
+    },
     'libvirt_host': {
         'type': str,
         'help': 'Hostname/IP address of the libvirt host',
@@ -38,11 +59,6 @@ SETTINGS = {
         'type': bool,
         'help': 'Flag to control the use of SSL when connecting to the libvirt host',
         'default': None
-    },
-    'num_nodes': {
-        'type': int,
-        'help': 'Number of nodes to use in the deployment',
-        'default': 4
     },
     'ram': {
         'type': int,
@@ -65,13 +81,13 @@ SETTINGS = {
         'default': 8
     },
     'roles': {
-        'type': str,
+        'type': list,
         'help': 'List of roles for each node. Example for two nodes: '
-                '[[admin, prometheus], [osd, mon, mgr]]',
-        'default': '[admin, prometheus, grafana], '
-                   '[osd, mon, mgr, rgw, igw], '
-                   '[osd, mon, mgr, mds, igw, ganesha], '
-                   '[osd, mon, mds, rgw, ganesha]'
+                '[["admin", "prometheus"], ["osd", "mon", "mgr"]]',
+        'default': [["admin", "prometheus", "grafana"],
+                    ["osd", "mon", "mgr", "rgw", "igw"],
+                    ["osd", "mon", "mgr", "mds", "igw", "ganesha"],
+                    ["osd", "mon", "mds", "rgw", "ganesha"]]
     },
     'public_network': {
         'type': str,
@@ -106,30 +122,11 @@ class Settings(object):
             if k not in kwargs:
                 setattr(self, k, v['default'])
 
-        self._post_process_settings()
-
-    def _post_process_settings(self):
-        # roles
-        roles = [n.strip() for n in self.roles.split(",")]
-        self.nodes = []
-        node = None
-        for role in roles:
-            if role.startswith('['):
-                node = []
-                node.append(role[1:])
-            elif role.endswith(']'):
-                node.append(role[:-1])
-                self.nodes.append(node)
-            else:
-                node.append(role)
-
 
 class SettingsEncoder(JSONEncoder):
     # pylint: disable=method-hidden
     def default(self, settings):
-        return {
-            'nodes': settings.nodes
-        }
+        return {k: getattr(settings, k) for k in SETTINGS}
 
 
 class Disk(object):
@@ -159,7 +156,7 @@ class Deployment(object):
 
     def _generate_nodes(self):
         node_id = 1
-        for node_roles in self.settings.nodes:
+        for node_roles in self.settings.roles:
             if 'admin' in node_roles:
                 # admin node
                 node = Node('admin', 'admin.{}'.format(self.settings.domain),
@@ -169,6 +166,11 @@ class Deployment(object):
                 node = Node('node{}'.format(node_id),
                             'node{}.{}'.format(node_id, self.settings.domain),
                             '{}{}'.format(self.settings.public_network, 200 + node_id))
+                if 'osd' in node_roles:
+                    node.cluster_address = '{}{}'.format(self.settings.cluster_network,
+                                                         200 + node_id)
+                    for _ in range(self.settings.num_disks):
+                        node.storage_disks.append(Disk(self.settings.disk_size))
                 node_id += 1
             self.nodes.append(node)
 
@@ -180,16 +182,17 @@ class Deployment(object):
             'libvirt_host': '192.168.1.103',
             'libvirt_user': 'rdias',
             'libvirt_use_ssl': 'true',
-            'ram': '4096',
-            'cpus': '2',
-            'vagrant_box': 'opensuse-leap-15.1',
+            'libvirt_storage_pool': 'vagrant',
+            'ram': self.settings.ram * 2**10,
+            'cpus': self.settings.cpus,
+            'vagrant_box': self.settings.os,
             'nodes': self.nodes,
             'admin': self.admin
         })
 
     def save(self):
         dep_dir = os.path.join(GlobalSettings.WORKING_DIR, self.dep_id)
-        os.makedirs(dep_dir, exist_ok=True)
+        os.makedirs(dep_dir, exist_ok=False)
         metadata_file = os.path.join(dep_dir, METADATA_FILENAME)
         with open(metadata_file, 'w') as file:
             json.dump({
@@ -199,14 +202,63 @@ class Deployment(object):
                 'settings': self.settings
             }, file, cls=SettingsEncoder)
 
+        vagrantfile = os.path.join(dep_dir, 'Vagrantfile')
+        with open(vagrantfile, 'w') as file:
+            file.write(self.generate_vagrantfile())
+
+        # generate ssh key pair
+        keys_dir = os.path.join(dep_dir, 'keys')
+        os.makedirs(keys_dir)
+        key = RSA.generate(2048)
+        private_key = key.export_key('PEM')
+        public_key = key.publickey().export_key('OpenSSH')
+
+        with open(os.path.join(keys_dir, 'id_rsa'), 'w') as file:
+            file.write(private_key.decode('utf-8'))
+        with open(os.path.join(keys_dir, 'id_rsa.pub'), 'w') as file:
+            file.write(public_key.decode('utf-8'))
+
+        # bin dir with helper scripts
+        bin_dir = os.path.join(dep_dir, 'bin')
+        os.makedirs(bin_dir)
+
+    def get_vagrant_box(self):
+        logger.info("Checking if vagrant box is already here: %s", self.settings.os)
+        found_box = False
+        output = tools.run_sync(["vagrant", "box", "list"])
+        output = output.decode('utf-8')
+        lines = output.split('\n')
+        for line in lines:
+            if line:
+                box_name = line.split()[0]
+                if box_name == self.settings.os:
+                    logger.info("Found vagrant box")
+                    found_box = True
+                    break
+
+        if not found_box:
+            logger.info("Vagrant box for '%s' is not installed, we need to add it",
+                        self.settings.os)
+
+            print("Downloading vagrant box: {}".format(self.settings.os))
+
+            def print_to_stdout(output):
+                if output:
+                    print("--> {}".format(output.decode('utf-8')))
+
+            tools.run_async(["stdbuf", "-oL", "vagrant", "box", "add", "--provider", "libvirt", "--name",
+                             self.settings.os, OS_BOX_MAPPING[self.settings.os]], print_to_stdout)
+
+
     def __str__(self):
         return "Deployment({}, {}, {})".format(self.dep_id, self.owner, self.name)
 
     @classmethod
     def create(cls, owner, name, settings):
-        dep = cls(str(uuid.uuid4()), owner, name, settings)
+        dep = cls(name.replace(' ', '_'), owner, name, settings)
         logger.info("creating new deployment: %s", dep)
         dep.save()
+        dep.get_vagrant_box()
         return dep
 
     @classmethod
