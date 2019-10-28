@@ -1,7 +1,10 @@
+from datetime import datetime
 import json
 from json import JSONEncoder
 import logging
 import os
+import random
+import shutil
 
 from Crypto.PublicKey import RSA
 
@@ -92,17 +95,17 @@ SETTINGS = {
     'public_network': {
         'type': str,
         'help': 'The network address prefix for the public network',
-        'default': '192.168.100.'
+        'default': None
     },
     'cluster_network': {
         'type': str,
         'help': 'The network address prefix for the cluster network',
-        'default': '192.168.170.'
+        'default': None
     },
     'domain': {
         'type': str,
         'help': 'The domain name for nodes',
-        'default': 'sesdev.com'
+        'default': '{}.com'
     }
 }
 
@@ -113,7 +116,7 @@ class Settings(object):
             if k not in SETTINGS:
                 logger.error("Setting '%s' is not known", k)
                 raise Exception("Unknown setting: {}".format(k))
-            if not isinstance(v, SETTINGS[k]['type']):
+            if v is not None and not isinstance(v, SETTINGS[k]['type']):
                 logger.error("Setting '%s' value has wrong type: expected %s but got %s", k,
                              SETTINGS[k]['type'], type(v))
                 raise Exception("Wrong value type for setting: {}".format(k))
@@ -146,25 +149,58 @@ class Node(object):
 
 
 class Deployment(object):
-    def __init__(self, dep_id, owner, name, settings):
+    def __init__(self, dep_id, settings):
         self.dep_id = dep_id
-        self.owner = owner
-        self.name = name
         self.settings = settings
-        self.nodes = []
+        self.nodes = {}
         self.admin = None
+
+        self._generate_networks()
+        self._generate_nodes()
+
+    @property
+    def dep_dir(self):
+        return os.path.join(GlobalSettings.WORKING_DIR, self.dep_id)
+
+    def _generate_networks(self):
+        if self.settings.public_network is not None and self.settings.cluster_network is not None:
+            return
+
+        deps = list_deployments()
+        existing_networks = [dep.settings.public_network for dep in deps
+                             if dep.settings.public_network]
+        existing_networks.extend([dep.settings.cluster_network for dep in deps
+                                  if dep.settings.cluster_network])
+        public_network = self.settings.public_network
+        cluster_network = self.settings.cluster_network
+
+        while True:
+            if public_network is None or public_network in existing_networks:
+                public_network = "10.20.{}.".format(random.randint(2, 200))
+            else:
+                break
+
+        while True:
+            if cluster_network is None or cluster_network in existing_networks:
+                cluster_network = "10.20.{}.".format(random.randint(2, 200))
+            else:
+                break
+
+        self.settings.public_network = public_network
+        self.settings.cluster_network = cluster_network
 
     def _generate_nodes(self):
         node_id = 1
         for node_roles in self.settings.roles:
             if 'admin' in node_roles:
                 # admin node
-                node = Node('admin', 'admin.{}'.format(self.settings.domain),
+                node = Node('admin', 'admin.{}'.format(self.settings.domain.format(self.dep_id)),
                             '{}{}'.format(self.settings.public_network, 200))
                 self.admin = node
             else:
                 node = Node('node{}'.format(node_id),
-                            'node{}.{}'.format(node_id, self.settings.domain),
+                            'node{}.{}'.format(node_id,
+                                               self.settings.domain.format(self.dep_id)),
                             '{}{}'.format(self.settings.public_network, 200 + node_id))
                 if 'osd' in node_roles:
                     node.cluster_address = '{}{}'.format(self.settings.cluster_network,
@@ -172,11 +208,9 @@ class Deployment(object):
                     for _ in range(self.settings.num_disks):
                         node.storage_disks.append(Disk(self.settings.disk_size))
                 node_id += 1
-            self.nodes.append(node)
+            self.nodes[node.name] = node
 
     def generate_vagrantfile(self):
-        self._generate_nodes()
-
         template = jinja_env.get_template('Vagrantfile.jinja')
         return template.render(**{
             'libvirt_host': '192.168.1.103',
@@ -186,28 +220,25 @@ class Deployment(object):
             'ram': self.settings.ram * 2**10,
             'cpus': self.settings.cpus,
             'vagrant_box': self.settings.os,
-            'nodes': self.nodes,
+            'nodes': [n for _, n in self.nodes.items()],
             'admin': self.admin
         })
 
     def save(self):
-        dep_dir = os.path.join(GlobalSettings.WORKING_DIR, self.dep_id)
-        os.makedirs(dep_dir, exist_ok=False)
-        metadata_file = os.path.join(dep_dir, METADATA_FILENAME)
+        os.makedirs(self.dep_dir, exist_ok=False)
+        metadata_file = os.path.join(self.dep_dir, METADATA_FILENAME)
         with open(metadata_file, 'w') as file:
             json.dump({
                 'id': self.dep_id,
-                'name': self.name,
-                'owner': self.owner,
                 'settings': self.settings
             }, file, cls=SettingsEncoder)
 
-        vagrantfile = os.path.join(dep_dir, 'Vagrantfile')
+        vagrantfile = os.path.join(self.dep_dir, 'Vagrantfile')
         with open(vagrantfile, 'w') as file:
             file.write(self.generate_vagrantfile())
 
         # generate ssh key pair
-        keys_dir = os.path.join(dep_dir, 'keys')
+        keys_dir = os.path.join(self.dep_dir, 'keys')
         os.makedirs(keys_dir)
         key = RSA.generate(2048)
         private_key = key.export_key('PEM')
@@ -215,18 +246,20 @@ class Deployment(object):
 
         with open(os.path.join(keys_dir, 'id_rsa'), 'w') as file:
             file.write(private_key.decode('utf-8'))
+        os.chmod(os.path.join(keys_dir, 'id_rsa'), 0o600)
+
         with open(os.path.join(keys_dir, 'id_rsa.pub'), 'w') as file:
             file.write(public_key.decode('utf-8'))
+        os.chmod(os.path.join(keys_dir, 'id_rsa.pub'), 0o600)
 
         # bin dir with helper scripts
-        bin_dir = os.path.join(dep_dir, 'bin')
+        bin_dir = os.path.join(self.dep_dir, 'bin')
         os.makedirs(bin_dir)
 
-    def get_vagrant_box(self):
+    def get_vagrant_box(self, log_handler):
         logger.info("Checking if vagrant box is already here: %s", self.settings.os)
         found_box = False
         output = tools.run_sync(["vagrant", "box", "list"])
-        output = output.decode('utf-8')
         lines = output.split('\n')
         for line in lines:
             if line:
@@ -240,29 +273,107 @@ class Deployment(object):
             logger.info("Vagrant box for '%s' is not installed, we need to add it",
                         self.settings.os)
 
-            print("Downloading vagrant box: {}".format(self.settings.os))
+            log_handler("Downloading vagrant box: {}\n".format(self.settings.os))
 
-            def print_to_stdout(output):
-                if output:
-                    print("--> {}".format(output.decode('utf-8')))
+            tools.run_async(["vagrant", "box", "add", "--provider", "libvirt", "--name",
+                             self.settings.os, OS_BOX_MAPPING[self.settings.os]], log_handler)
 
-            tools.run_async(["stdbuf", "-oL", "vagrant", "box", "add", "--provider", "libvirt", "--name",
-                             self.settings.os, OS_BOX_MAPPING[self.settings.os]], print_to_stdout)
+    def vagrant_up(self, node, log_handler):
+        if node is None:
+            node = ""
+        tools.run_async(["vagrant", "up", node], log_handler, self.dep_dir)
 
+    def destroy(self, log_handler):
+        tools.run_async(["vagrant", "destroy", "--force"], log_handler, self.dep_dir)
+        shutil.rmtree(self.dep_dir)
+
+    def _stop(self, node, log_handler):
+        ssh_cmd = self._ssh_cmd(node)
+        ssh_cmd.extend(['echo "sleep 2 && shutdown -h now" > /root/shutdown.sh && chmod +x /root/shutdown.sh'])
+        tools.run_sync(ssh_cmd)
+        ssh_cmd = self._ssh_cmd(node)
+        ssh_cmd.extend(['nohup /root/shutdown.sh > /dev/null 2>&1 &'])
+        tools.run_sync(ssh_cmd)
+
+    def stop(self, node=None, log_handler=None):
+        if node and node not in self.nodes:
+            raise Exception("Node '{}' does not exist in this deployment".format(name))
+        elif node:
+            self._stop(node, log_handler)
+        else:
+            for node in self.nodes:
+                self._stop(node, log_handler)
+
+    def start(self, node=None, log_handler=None):
+        if node and node not in self.nodes:
+            raise Exception("Node '{}' does not exist in this deployment".format(name))
+
+        self.get_vagrant_box(log_handler)
+        self.vagrant_up(node, log_handler)
 
     def __str__(self):
-        return "Deployment({}, {}, {})".format(self.dep_id, self.owner, self.name)
+        return self.dep_id
+
+    def status(self):
+        nodes_info = {}
+        out = tools.run_sync(["vagrant", "status"], cwd=self.dep_dir)
+        for line in [line.strip() for line in out.split('\n')]:
+            if line:
+                line_arr = line.split(' ', 1)
+                if line_arr[0] in self.nodes:
+                    if line_arr[1].strip().startswith("running"):
+                        nodes_info[line_arr[0]] = "running"
+                    elif line_arr[1].strip().startswith("not created"):
+                        nodes_info[line_arr[0]] = "not deployed"
+                    elif line_arr[1].strip().startswith("shutoff"):
+                        nodes_info[line_arr[0]] = "stopped"
+                    elif line_arr[1].strip().startswith("paused"):
+                        nodes_info[line_arr[0]] = "suspended"
+        result = "{}:\n".format(self.dep_id)
+        for k, v in nodes_info.items():
+            result += "  - {}: {}\n".format(k, v)
+        return result
+
+    def _ssh_cmd(self, name):
+        if name not in self.nodes:
+            raise Exception("Node '{}' does not exist in this deployment".format(name))
+
+        out = tools.run_sync(["vagrant", "ssh-config", name], cwd=self.dep_dir)
+        address = None
+        proxycmd = None
+        for line in out.split('\n'):
+            line = line.strip()
+            if line.startswith('HostName'):
+                address = line[len('HostName')+1:]
+            elif line.startswith('ProxyCommand'):
+                proxycmd = line[len('ProxyCommand')+1:]
+
+        if address is None:
+            raise Exception("Could not get HostName info from 'vagrant ssh-config {}' command"
+                            .format(name))
+        if proxycmd is None:
+            raise Exception("Could not get ProxyCommand info from 'vagrant ssh-config {}' command"
+                            .format(name))
+
+        dep_private_key = os.path.join(self.dep_dir, "keys/id_rsa")
+        return ["ssh", "root@{}".format(address), "-i", dep_private_key,
+                "-o", "IdentitiesOnly yes", "-o", "StrictHostKeyChecking no",
+                "-o", "UserKnownHostsFile /dev/null", "-o", "PasswordAuthentication no",
+                "-o", "ProxyCommand={}".format(proxycmd)]
+
+    def ssh(self, name):
+        tools.run_interactive(self._ssh_cmd(name))
 
     @classmethod
-    def create(cls, owner, name, settings):
-        dep = cls(name.replace(' ', '_'), owner, name, settings)
+    def create(cls, dep_id, settings):
+        dep = cls(dep_id, settings)
         logger.info("creating new deployment: %s", dep)
         dep.save()
-        dep.get_vagrant_box()
         return dep
 
     @classmethod
-    def load(cls, dep_dir):
+    def load(cls, dep_id):
+        dep_dir = os.path.join(GlobalSettings.WORKING_DIR, dep_id)
         if not os.path.exists(dep_dir) or not os.path.isdir(dep_dir):
             logger.debug("%s does not exist or is not a directory", dep_dir)
             return None
@@ -274,7 +385,7 @@ class Deployment(object):
         with open(metadata_file, 'r') as file:
             metadata = json.load(file)
 
-        return cls(metadata['id'], metadata['owner'], metadata['name'], metadata['settings'])
+        return cls(metadata['id'], Settings(**metadata['settings']))
 
 
 def list_deployments():
@@ -284,15 +395,15 @@ def list_deployments():
     deps = []
     if not os.path.exists(GlobalSettings.WORKING_DIR):
         return deps
-    for dep_dir in os.listdir(GlobalSettings.WORKING_DIR):
-        dep = Deployment.load(os.path.join(GlobalSettings.WORKING_DIR, dep_dir))
+    for dep_id in os.listdir(GlobalSettings.WORKING_DIR):
+        dep = Deployment.load(dep_id)
         if dep:
             deps.append(dep)
     return deps
 
 
-def create_deployment(owner, name, settings):
+def destroy_deployment(deployment_id, log_handler):
     """
-    Create a new SES deployment
+    Destroy an existing SES deployment
     """
-    return Deployment.create(owner, name, settings)
+    return Deployment.destroy(deployment_id, log_handler)

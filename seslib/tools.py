@@ -1,6 +1,11 @@
 import fcntl
+import logging
 import os
 import subprocess
+import sys
+
+
+logger = logging.getLogger(__name__)
 
 
 class CmdException(Exception):
@@ -12,12 +17,13 @@ class CmdException(Exception):
         self.stderr = stderr
 
 
-def run_sync(command):
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+def run_sync(command, cwd=None):
+    logger.info("Running command (%s): %s", cwd if cwd else ".", command)
+    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd=cwd) as proc:
         stdout, stderr = proc.communicate()
         if proc.returncode != 0:
             raise CmdException(command, proc.returncode, stderr)
-    return stdout
+    return stdout.decode('utf-8')
 
 def _non_block_read(fout):
     fd = fout.fileno()
@@ -26,19 +32,28 @@ def _non_block_read(fout):
     try:
         return fout.read()
     except:
-        return ''
+        return None
 
-def run_async(command, callback):
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as proc:
+def run_async(command, callback, cwd=None):
+    logger.info("Running command (%s): %s", cwd if cwd else ".", command)
+    callback("=== Running shell command ===\n{}\n".format(" ".join(command)))
+    _command = ["stdbuf", "-oL"]
+    _command.extend(command)
+    with subprocess.Popen(_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          cwd=cwd) as proc:
         while True:
             output = _non_block_read(proc.stdout)
-            if output is not None:
-                output = output.strip()
             if output:
                 # got new output
-                callback(output)
+                callback(output.decode('utf-8'))
             retcode = proc.poll()
             if retcode is not None:
                 if retcode != 0:
                     raise CmdException(command, retcode, proc.stderr.read())
                 break
+
+def run_interactive(command, cwd=None):
+    logger.info("Running command (%s): %s", cwd if cwd else ".", command)
+    r = subprocess.call(command, stdout=sys.stdout, stdin=sys.stdin)
+    if r != 0:
+        raise CmdException(command, r, "")

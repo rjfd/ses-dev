@@ -57,7 +57,7 @@ Vagrant.configure("2") do |config|
 
     node.vm.provision "shell", inline: <<-SHELL
 {% for _node in nodes %}
-      echo "{{ _node.public_address }} {{ _node.name }} {{ _node.fqdn }}" >> /etc/hosts
+      echo "{{ _node.public_address }} {{ _node.fqdn }} {{ _node.name }}" >> /etc/hosts
 {% endfor %}
 
       zypper -n install vim git iputils hostname jq make
